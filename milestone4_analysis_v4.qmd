@@ -1,0 +1,489 @@
+---
+title: "Taipei Housing Prices"
+subtitle: "Adjusted Price Gaps and a Prediction Check — Team 14"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    toc: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Research questions
+
+Our main question is how much the price-per-ping gap between high-rise and
+walk-up apartment sales changes after accounting for district and floor area.
+As a secondary question, we test whether adding those variables improves
+predictions for transactions left out of model fitting.
+
+The proposal also asks whether housing-price relationships vary across place,
+time, and market segment. The current weekly data are heavily concentrated in
+2026, and completion dates are unavailable for the 2026 analysis sample. We
+therefore treat the current results as a focused analysis of the available
+2026 sales. We test district-specific differences in the building-type gap
+only where both building types have enough observations for a cautious
+comparison. MRT accessibility remains a proposed extension, subject to
+reliable address matching.
+
+These are associations in recorded sales. The models do not identify causal
+effects. District is used as a statistical adjustment variable here. We do
+not label it a causal confounder without a causal design and assumptions.
+
+## Team roles and handoffs
+
+| Role | Main responsibility | Handoff |
+|---|---|---|
+| 1. Data and sample | Check fields, units, exclusions, missing values, and district-by-type counts. | Freeze the shared analysis sample. |
+| 2. Regression | Fit the three nested association models and check estimates and intervals. | Deliver the model table. |
+| 3. Prediction and diagnostics | Compare out-of-sample errors and inspect residual and subgroup error patterns. | State what predicts well and where errors remain. |
+| 4. Report and presentation | Render this report, prepare the main results slide, and coordinate the optional extension. | Deliver the checked report and presentation. |
+
+## 1. Prepare the common analysis sample
+
+The cleaning script creates the processed file. We retain eligible 2026
+high-rise and walk-up sales with positive price per ping and floor area and a
+recorded district. All three association models and the prediction comparison
+use the same eligible observations.
+
+```{r}
+required_packages <- c("sandwich", "ggplot2")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop("Install required packages first: ", paste(missing_packages, collapse = ", "))
+}
+library(ggplot2)
+
+sales <- read.csv(
+  "data/processed/taipei_residential_sales.csv",
+  fileEncoding = "UTF-8",
+  stringsAsFactors = FALSE
+)
+
+required_columns <- c(
+  "year", "building_group", "price_per_ping_10k_ntd", "FAREA", "DISTRICT"
+)
+missing_columns <- setdiff(required_columns, names(sales))
+if (length(missing_columns) > 0) {
+  stop("Missing columns: ", paste(missing_columns, collapse = ", "))
+}
+
+analysis_data <- subset(
+  sales,
+  year == 2026 &
+    building_group %in% c("High-rise (11+ floors)", "Walk-up apartment") &
+    is.finite(price_per_ping_10k_ntd) & price_per_ping_10k_ntd > 0 &
+    is.finite(FAREA) & FAREA > 0 &
+    !is.na(DISTRICT) & nzchar(DISTRICT)
+)
+
+analysis_data$building_group <- factor(
+  analysis_data$building_group,
+  levels = c("Walk-up apartment", "High-rise (11+ floors)")
+)
+analysis_data$DISTRICT <- factor(analysis_data$DISTRICT)
+analysis_data$log_price_per_ping <- log(analysis_data$price_per_ping_10k_ntd)
+analysis_data$log_area <- log(analysis_data$FAREA)
+
+if (nrow(analysis_data) == 0) stop("No eligible 2026 transactions found.")
+
+district_names <- c(
+  "中正區" = "Zhongzheng", "大同區" = "Datong", "中山區" = "Zhongshan",
+  "松山區" = "Songshan", "大安區" = "Da'an", "萬華區" = "Wanhua",
+  "信義區" = "Xinyi", "士林區" = "Shilin", "北投區" = "Beitou",
+  "內湖區" = "Neihu", "南港區" = "Nangang", "文山區" = "Wenshan"
+)
+
+district_counts <- as.data.frame.matrix(
+  with(analysis_data, table(DISTRICT, building_group))
+)
+district_counts$District <- district_names[rownames(district_counts)]
+district_counts <- district_counts[, c("District", setdiff(names(district_counts), "District"))]
+rownames(district_counts) <- NULL
+
+sample_summary <- data.frame(
+  Measure = c("Eligible transactions", "High-rise sales", "Walk-up sales"),
+  Count = c(
+    nrow(analysis_data),
+    sum(analysis_data$building_group == "High-rise (11+ floors)"),
+    sum(analysis_data$building_group == "Walk-up apartment")
+  )
+)
+knitr::kable(sample_summary, row.names = FALSE, caption = "Analysis sample")
+knitr::kable(district_counts, row.names = FALSE,
+             caption = "Transactions by district and building type")
+```
+
+The supplied snapshot is expected to produce 247 eligible sales: 158
+high-rises and 89 walk-ups. Check these counts before interpreting results.
+
+## 2. Association analysis with three nested models
+
+The outcome is log price per ping. Walk-up apartments are the reference group.
+The building-type coefficient estimates the high-rise difference relative to
+walk-ups. Model 2 adds district indicators. Model 3 also adds log floor area.
+
+```{r}
+model_1 <- lm(log_price_per_ping ~ building_group, data = analysis_data)
+model_2 <- lm(log_price_per_ping ~ building_group + DISTRICT, data = analysis_data)
+model_3 <- lm(
+  log_price_per_ping ~ building_group + DISTRICT + log_area,
+  data = analysis_data
+)
+
+models <- list(
+  "1. Building type" = model_1,
+  "2. Add district" = model_2,
+  "3. Add floor area" = model_3
+)
+
+extract_gap <- function(model, model_name) {
+  term <- "building_groupHigh-rise (11+ floors)"
+  robust_vcov <- sandwich::vcovHC(model, type = "HC3")
+  estimate <- coef(model)[term]
+  se <- sqrt(robust_vcov[term, term])
+  critical <- qt(0.975, df = df.residual(model))
+
+  data.frame(
+    Model = model_name,
+    N = nobs(model),
+    Gap_percent = 100 * (exp(estimate) - 1),
+    CI_low = 100 * (exp(estimate - critical * se) - 1),
+    CI_high = 100 * (exp(estimate + critical * se) - 1),
+    R_squared = summary(model)$r.squared,
+    In_sample_RMSE_log = sqrt(mean(residuals(model)^2)),
+    row.names = NULL
+  )
+}
+
+gap_results <- do.call(rbind, Map(extract_gap, models, names(models)))
+rownames(gap_results) <- NULL
+
+gap_table <- transform(
+  gap_results,
+  Gap_percent = round(Gap_percent, 1),
+  CI_low = round(CI_low, 1),
+  CI_high = round(CI_high, 1),
+  R_squared = round(R_squared, 3),
+  In_sample_RMSE_log = round(In_sample_RMSE_log, 3)
+)
+knitr::kable(
+  gap_table,
+  row.names = FALSE,
+  col.names = c("Model", "N", "Gap (%)", "95% CI low (%)", "95% CI high (%)",
+                "In-sample R-squared", "In-sample RMSE, log price"),
+  caption = "Adjusted high-rise price-per-ping gap relative to walk-ups"
+)
+```
+
+```{r}
+ggplot(gap_results, aes(x = Gap_percent, y = reorder(Model, Gap_percent))) +
+  geom_vline(xintercept = 0, color = "grey65", linetype = "dashed") +
+  geom_errorbar(
+    aes(xmin = CI_low, xmax = CI_high),
+    width = 0.16, orientation = "y", color = "#315B7D", linewidth = 0.8
+  ) +
+  geom_point(color = "#C45A36", size = 3) +
+  labs(
+    title = "Estimated high-rise price gap across models",
+    x = "Difference from walk-up apartments (%)",
+    y = NULL,
+    caption = "Points are estimates; bars are 95% HC3 confidence intervals."
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+These three models are a **stepwise adjustment sequence**. They show how the
+estimated association changes when district and floor area are added. They do
+not, by themselves, show that prediction accuracy keeps improving. In-sample
+R-squared cannot fall when predictors are added to nested ordinary least
+squares models. We assess prediction separately below.
+
+## 3. Prediction check on held-out transactions
+
+The proposal asks whether property and location information improves
+predictions for unseen transactions. We use repeated stratified five-fold
+cross-validation. Each sale is predicted by models fitted without that fold.
+The same folds are used for all three models. Errors are measured on the log
+price-per-ping scale, so compare models within this analysis rather than
+reading the error as NT dollars.
+
+```{r}
+set.seed(2026)
+k_folds <- 5
+n_repeats <- 20
+strata <- interaction(analysis_data$DISTRICT, analysis_data$building_group, drop = TRUE)
+cv_rows <- vector("list", n_repeats * k_folds * length(models))
+row_number <- 1
+
+for (repeat_id in seq_len(n_repeats)) {
+  fold_id <- integer(nrow(analysis_data))
+
+  for (stratum in levels(strata)) {
+    rows <- which(strata == stratum)
+    rows <- sample(rows)
+    fold_id[rows] <- rep(seq_len(k_folds), length.out = length(rows))
+  }
+
+  for (fold in seq_len(k_folds)) {
+    train_data <- analysis_data[fold_id != fold, , drop = FALSE]
+    test_data <- analysis_data[fold_id == fold, , drop = FALSE]
+
+    for (model_name in names(models)) {
+      fitted_model <- lm(formula(models[[model_name]]), data = train_data)
+      predicted <- predict(fitted_model, newdata = test_data)
+
+      if (anyNA(predicted)) {
+        stop("Cross-validation produced missing predictions. Check factor levels.")
+      }
+
+      cv_rows[[row_number]] <- data.frame(
+        Repeat = repeat_id,
+        Fold = fold,
+        Model = model_name,
+        Observed = test_data$log_price_per_ping,
+        Predicted = as.numeric(predicted),
+        Building_type = test_data$building_group,
+        District = test_data$DISTRICT
+      )
+      row_number <- row_number + 1
+    }
+  }
+}
+
+cv_predictions <- do.call(rbind, cv_rows)
+cv_summary <- do.call(rbind, lapply(split(cv_predictions, cv_predictions$Model), function(x) {
+  data.frame(
+    Model = x$Model[1],
+    CV_RMSE_log = sqrt(mean((x$Observed - x$Predicted)^2)),
+    CV_MAE_log = mean(abs(x$Observed - x$Predicted)),
+    row.names = NULL
+  )
+}))
+rownames(cv_summary) <- NULL
+cv_summary$CV_RMSE_log <- round(cv_summary$CV_RMSE_log, 3)
+cv_summary$CV_MAE_log <- round(cv_summary$CV_MAE_log, 3)
+knitr::kable(cv_summary, row.names = FALSE,
+             col.names = c("Model", "CV RMSE (log price)",
+                           "CV MAE (log price)"),
+             caption = "Repeated five-fold cross-validated prediction errors")
+```
+
+Lower cross-validated RMSE or MAE indicates better average prediction in this
+sample and validation setup. The comparison tests whether adding district and
+floor area improves prediction. It does not require LASSO or ridge because
+these models contain a limited set of predictors. Those methods become more
+relevant if the team expands to many predictors and wants to compare
+regularized prediction models.
+
+We also summarize cross-validated absolute error by building type. This helps
+show whether one group is harder to predict.
+
+```{r}
+cv_by_type <- aggregate(
+  abs(Observed - Predicted) ~ Model + Building_type,
+  data = cv_predictions,
+  FUN = mean
+)
+names(cv_by_type)[3] <- "Mean_absolute_error_log"
+cv_by_type$Mean_absolute_error_log <- round(cv_by_type$Mean_absolute_error_log, 3)
+knitr::kable(cv_by_type, row.names = FALSE,
+             col.names = c("Model", "Building type",
+                           "Mean absolute error (log price)"),
+             caption = "Cross-validated absolute error by building type")
+```
+
+## 4. Extension: does the price gap differ by district?
+
+The proposal asks whether price relationships vary across districts. We first
+set a minimum coverage rule: include a district only when the analysis sample
+contains at least eight sales of each building type there. The rule is based
+on counts, before examining the estimated gaps. The current snapshot leaves
+five districts that meet it.
+
+Within those districts, we fit a model that allows the high-rise versus
+walk-up gap to differ by district while accounting for log floor area. The
+estimates are exploratory because the district-level groups remain small.
+
+```{r}
+district_table <- with(analysis_data, table(DISTRICT, building_group))
+supported_districts <- rownames(district_table)[
+  district_table[, "High-rise (11+ floors)"] >= 8 &
+    district_table[, "Walk-up apartment"] >= 8
+]
+
+district_data <- droplevels(
+  subset(analysis_data, DISTRICT %in% supported_districts)
+)
+
+district_gap_model <- lm(
+  log_price_per_ping ~ building_group * DISTRICT + log_area,
+  data = district_data
+)
+
+district_gap <- function(district, model, data) {
+  new_data <- data.frame(
+    building_group = factor(
+      c("Walk-up apartment", "High-rise (11+ floors)"),
+      levels = levels(data$building_group)
+    ),
+    DISTRICT = factor(district, levels = levels(data$DISTRICT)),
+    log_area = mean(data$log_area)
+  )
+
+  design <- model.matrix(
+    delete.response(terms(model)),
+    new_data,
+    contrasts.arg = model$contrasts
+  )
+  contrast <- design[2, ] - design[1, ]
+  robust_vcov <- sandwich::vcovHC(model, type = "HC3")
+  estimate <- sum(contrast * coef(model))
+  se <- sqrt(drop(contrast %*% robust_vcov %*% contrast))
+  critical <- qt(0.975, df = df.residual(model))
+  district_rows <- data[data$DISTRICT == district, , drop = FALSE]
+
+  data.frame(
+    District = unname(district_names[district]),
+    High_rise_sales = sum(district_rows$building_group == "High-rise (11+ floors)"),
+    Walk_up_sales = sum(district_rows$building_group == "Walk-up apartment"),
+    Gap_percent = 100 * (exp(estimate) - 1),
+    CI_low = 100 * (exp(estimate - critical * se) - 1),
+    CI_high = 100 * (exp(estimate + critical * se) - 1),
+    row.names = NULL
+  )
+}
+
+district_gap_results <- do.call(
+  rbind,
+  lapply(supported_districts, district_gap,
+         model = district_gap_model, data = district_data)
+)
+rownames(district_gap_results) <- NULL
+
+district_gap_table <- transform(
+  district_gap_results,
+  Gap_percent = round(Gap_percent, 1),
+  CI_low = round(CI_low, 1),
+  CI_high = round(CI_high, 1)
+)
+knitr::kable(
+  district_gap_table,
+  row.names = FALSE,
+  col.names = c("District", "High-rise n", "Walk-up n", "Gap (%)",
+                "95% CI low (%)", "95% CI high (%)"),
+  caption = "District-specific adjusted price gaps in districts meeting the count rule"
+)
+```
+
+```{r}
+ggplot(district_gap_results, aes(x = Gap_percent, y = reorder(District, Gap_percent))) +
+  geom_vline(xintercept = 0, color = "grey65", linetype = "dashed") +
+  geom_errorbar(
+    aes(xmin = CI_low, xmax = CI_high),
+    width = 0.16, orientation = "y", color = "#315B7D", linewidth = 0.8
+  ) +
+  geom_point(color = "#C45A36", size = 2.8) +
+  labs(
+    title = "Adjusted price gaps across supported districts",
+    x = "High-rise difference from walk-ups (%)",
+    y = NULL,
+    caption = "At least eight sales of each type per district; 95% HC3 intervals."
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+This extension asks whether a single citywide gap describes the districts
+with adequate sample overlap. Wide or overlapping intervals mean the data do
+not precisely distinguish district-specific gaps. Do not rank districts or
+claim a difference from point estimates alone.
+
+## 5. Residual diagnostics
+
+Residuals are the differences between observed and fitted log price per ping
+for the same transactions used to fit Model 3. They are useful for checking
+whether a pattern remains, but they are not the same as test-set prediction
+errors. The cross-validation section above evaluates predictions on held-out
+folds.
+
+```{r}
+diagnostic_data <- data.frame(
+  Fitted = fitted(model_3),
+  Residual = residuals(model_3),
+  Floor_area = analysis_data$FAREA
+)
+
+ggplot(diagnostic_data, aes(x = Fitted, y = Residual)) +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_point(alpha = 0.55, color = "#315B7D") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+              color = "#C45A36", linewidth = 0.8) +
+  labs(title = "Model 3 residuals by fitted value",
+       x = "Fitted log price per ping", y = "Residual") +
+  theme_minimal(base_size = 11)
+
+ggplot(diagnostic_data, aes(x = Floor_area, y = Residual)) +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_point(alpha = 0.55, color = "#315B7D") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+              color = "#C45A36", linewidth = 0.8) +
+  labs(title = "Model 3 residuals by floor area",
+       x = "Floor area (ping)", y = "Residual in log price per ping") +
+  theme_minimal(base_size = 11)
+```
+
+Look for a curve, changing spread, or clusters. A pattern can suggest that a
+relevant feature is missing or that a relationship is not well represented.
+Do not add variables solely to force residuals toward zero. Record the pattern,
+propose a defensible adjustment, then compare it on the same sample and in
+cross-validation.
+
+## 6. Proposal extension: accessibility and location
+
+The proposal names MRT accessibility and nearby amenities as optional
+extensions. The current transaction file contains `LOCATION` addresses. If
+the team wants one spatial extension, start with distance to the nearest MRT
+entrance. Taipei publishes address-coordinate data and MRT entrance
+coordinates. The work would be to match transaction addresses to coordinates,
+calculate distance to the nearest entrance, report the address-match rate,
+and add distance to Model 3. Define clearly whether the measure is straight
+line distance or walking distance. Do not describe distance as travel time
+unless a pedestrian route network is used.
+
+This extension asks whether proximity adds information after district and
+floor area are included. It is an association, and it should be kept only if
+the geocoding match is reliable. Avoid adding MRT, bus stops, malls, tourist
+sites, and an undefined “egg-yolk/egg-white” classification all at once.
+
+## 7. Limits and next steps
+
+- The current regression sample describes recorded 2026 sales in this snapshot.
+- Earlier years are sparse in this weekly snapshot, so a 2019–2026 trend or
+  time-varying price gap needs a better-covered historical extract.
+- Completion dates are missing for the current sample, so building-age effects
+  cannot be tested here.
+- Elevator status overlaps with building type in this sample, so a separate
+  elevator premium is not identified by this specification.
+- The adjusted association models do not establish causality. Unmeasured
+  factors such as exact micro-location, renovation, view, and building quality
+  may remain.
+- The district-by-building-type interaction is explored above only for
+  districts meeting the stated minimum-count rule.
+
+## Presentation sequence
+
+1. State the research question and show the eligible sample.
+2. Use the existing district and building-type plots to describe the data.
+3. Show the three adjusted-gap estimates and explain that they trace the
+   association as controls are added.
+4. Show cross-validated errors separately to answer whether added predictors
+   improve prediction on held-out transactions.
+5. Show the district interaction as an exploratory check of whether the gap
+   varies by location, with district counts and confidence intervals.
+6. Use residual plots to discuss remaining patterns and limits.
+7. Present nearest-MRT distance only if address matching is reliable; otherwise
+   keep it as a proposed extension.

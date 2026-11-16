@@ -1,0 +1,285 @@
+---
+title: "Taipei Housing Prices: Adjusted Building-Type Price Gap"
+subtitle: "Team 14 — Core Regression Analysis"
+format:
+  pdf:
+    documentclass: article
+    geometry: margin=1in
+    toc: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Research question
+
+How much of the price-per-ping gap between high-rise and walk-up apartment
+sales in our 2026 Taipei sample remains after accounting for district and
+floor area?
+
+This is an associational analysis of recorded transactions. The estimates do
+not show that changing a building's type would cause its price to change.
+
+## Team workflow and handoffs
+
+| Role | Responsibility | Handoff |
+|---|---|---|
+| 1. Data and sample | Confirm the cleaned file, variable units, eligibility rules, and district-by-building-type counts. | Approve the common analysis sample. |
+| 2. Modeling | Fit all three models below on the same rows and check coefficient direction and reference group. | Provide model estimates and intervals. |
+| 3. Results and checks | Interpret the comparison, inspect residual patterns, and assess whether district coverage supports an extension. | Provide the main finding and limitations. |
+| 4. Report and presentation | Render this report, prepare the results slide, and coordinate final review. | Share the rendered report and presentation. |
+
+## 1. Prepare the analysis sample
+
+The cleaning script produces the processed CSV. This report narrows it to
+2026 sales classified as high-rise or walk-up apartments, with positive price
+per ping and floor area and a recorded district. The same resulting rows are
+used in all three models.
+```{r}
+#| label: setup
+#| include: false
+
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(scales)
+```
+
+```{r}
+required_packages <- c("sandwich", "ggplot2")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install required packages first: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+sales <- read.csv(
+  "data/processed/taipei_residential_sales.csv",
+  fileEncoding = "UTF-8",
+  stringsAsFactors = FALSE
+)
+
+required_columns <- c(
+  "year", "building_group", "price_per_ping_10k_ntd", "FAREA", "DISTRICT"
+)
+missing_columns <- setdiff(required_columns, names(sales))
+if (length(missing_columns) > 0) {
+  stop("Missing required columns: ", paste(missing_columns, collapse = ", "))
+}
+
+analysis_data <- subset(
+  sales,
+  year == 2026 &
+    building_group %in% c("High-rise (11+ floors)", "Walk-up apartment") &
+    is.finite(price_per_ping_10k_ntd) & price_per_ping_10k_ntd > 0 &
+    is.finite(FAREA) & FAREA > 0 &
+    !is.na(DISTRICT) & nzchar(DISTRICT)
+)
+
+analysis_data$building_group <- factor(
+  analysis_data$building_group,
+  levels = c("Walk-up apartment", "High-rise (11+ floors)")
+)
+analysis_data$DISTRICT <- factor(analysis_data$DISTRICT)
+analysis_data$log_price_per_ping <- log(analysis_data$price_per_ping_10k_ntd)
+analysis_data$log_area <- log(analysis_data$FAREA)
+
+if (nrow(analysis_data) == 0) {
+  stop("No eligible 2026 high-rise or walk-up sales were found.")
+}
+
+cat("Analysis sample size:", nrow(analysis_data), "\n")
+table(analysis_data$building_group)
+with(analysis_data, table(DISTRICT, building_group))
+```
+
+**Check before continuing.** Confirm the counts and the district table. The
+current snapshot is expected to give 247 eligible transactions, with 158
+high-rises and 89 walk-up apartments. If your refreshed data differ, use the
+counts printed by this report and investigate the sample definition before
+interpreting the models.
+
+## 2. Fit the three models
+
+The outcome is the natural logarithm of price per ping. Walk-up apartments
+are the reference group, so the high-rise coefficient is the estimated
+high-rise difference relative to walk-ups.
+
+```{r}
+model_1 <- lm(
+  log_price_per_ping ~ building_group,
+  data = analysis_data
+)
+
+model_2 <- lm(
+  log_price_per_ping ~ building_group + DISTRICT,
+  data = analysis_data
+)
+
+model_3 <- lm(
+  log_price_per_ping ~ building_group + DISTRICT + log_area,
+  data = analysis_data
+)
+
+models <- list(
+  "Building type only" = model_1,
+  "Add district" = model_2,
+  "Add district and floor area" = model_3
+)
+
+```
+
+| Model | Formula | Interpretation |
+|---|---|---|
+| 1 | Building type | Pooled high-rise versus walk-up price association. |
+| 2 | Building type + district | The association after accounting for district. |
+| 3 | Building type + district + log floor area | The association after accounting for district and floor area. |
+
+## 3. Compare the estimated price gaps
+
+Exponentiating a log-price coefficient converts it to a percentage difference.
+The intervals below use HC3 robust standard errors.
+
+```{r}
+extract_gap <- function(model, model_name) {
+  coefficient_name <- "building_groupHigh-rise (11+ floors)"
+  if (!coefficient_name %in% names(coef(model))) {
+    stop(
+      "High-rise coefficient missing in ", model_name,
+      ". Check that both building types are present."
+    )
+  }
+
+  robust_vcov <- sandwich::vcovHC(model, type = "HC3")
+  estimate <- coef(model)[coefficient_name]
+  standard_error <- sqrt(robust_vcov[coefficient_name, coefficient_name])
+  critical_value <- qt(0.975, df = df.residual(model))
+
+  data.frame(
+    Model = model_name,
+    N = nobs(model),
+    Gap = 100 * (exp(estimate) - 1),
+    Lower = 100 * (exp(estimate - critical_value * standard_error) - 1),
+    Upper = 100 * (exp(estimate + critical_value * standard_error) - 1),
+    R_squared = summary(model)$r.squared,
+    RMSE_log_price = sqrt(mean(residuals(model)^2)),
+    row.names = NULL
+  )
+}
+
+results <- do.call(
+  rbind,
+  Map(extract_gap, models, names(models))
+)
+
+knitr::kable(
+  transform(
+    results,
+    Gap = round(Gap, 1),
+    Lower = round(Lower, 1),
+    Upper = round(Upper, 1),
+    R_squared = round(R_squared, 3),
+    RMSE_log_price = round(RMSE_log_price, 3)
+  ),
+  col.names = c(
+    "Model", "Transactions", "Gap (%)", "95% CI lower (%)",
+    "95% CI upper (%)", "R-squared", "Residual RMSE"
+  ),
+  caption = "Estimated high-rise price-per-ping difference relative to walk-ups"
+)
+```
+
+```{r}
+ggplot(results, aes(x = Gap, y = reorder(Model, Gap))) +
+  geom_vline(xintercept = 0, color = "grey65", linetype = "dashed") +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper), height = 0.16,
+                 color = "#315B7D", linewidth = 0.8) +
+  geom_point(color = "#C45A36", size = 3) +
+  labs(
+    title = "High-rise price-per-ping gap across model specifications",
+    x = "Estimated difference from walk-up apartments (%)",
+    y = NULL,
+    caption = "Points show estimates. Bars show 95% HC3 robust confidence intervals."
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+**Interpret the output.** Compare how the estimate changes as district and
+floor area enter the model. A smaller estimate after adjustment means the
+adjusted association differs from the pooled association. It does not, by
+itself, identify a causal effect or prove that any one district caused the
+change.
+
+## 4. Model fit and residual check
+
+R-squared and residual RMSE describe fit on these same transactions. They do
+not measure prediction accuracy on new sales. The residual plot checks for a
+visible pattern against floor area that the linear log-area term may miss.
+
+```{r}
+fit_summary <- data.frame(
+  Model = names(models),
+  N = vapply(models, nobs, numeric(1)),
+  R_squared = vapply(models, function(model) summary(model)$r.squared, numeric(1)),
+  RMSE_log_price = vapply(
+    models,
+    function(model) sqrt(mean(residuals(model)^2)),
+    numeric(1)
+  )
+)
+knitr::kable(transform(
+  fit_summary,
+  R_squared = round(R_squared, 3),
+  RMSE_log_price = round(RMSE_log_price, 3)
+))
+```
+
+```{r}
+diagnostic_data <- data.frame(
+  Fitted = fitted(model_3),
+  Residual = residuals(model_3),
+  Floor_area = analysis_data$FAREA
+)
+
+ggplot(diagnostic_data, aes(x = Floor_area, y = Residual)) +
+  geom_hline(yintercept = 0, color = "grey50", linetype = "dashed") +
+  geom_point(alpha = 0.55, color = "#315B7D") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+              color = "#C45A36", linewidth = 0.8) +
+  labs(
+    title = "Model 3 residuals by floor area",
+    x = "Floor area (ping)",
+    y = "Residual in log price per ping"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+Look for a systematic curve or widening spread. Individual residuals can be
+large even when the average price gap is estimated with a clear confidence
+interval. If a strong pattern appears, discuss a specific adjustment with the
+group and compare it using the same sample.
+
+## 5. Limitations and next step
+
+- The estimates describe recorded 2026 transactions in this dataset.
+- The earlier years in the snapshot have uneven coverage, so the core analysis
+  uses 2026 only.
+- Building type and elevator status overlap in this sample, so this analysis
+  does not isolate a separate elevator premium.
+- Building completion dates are unavailable for the current 2026 sample, so
+  building age is not included.
+- District-specific gaps are an optional extension. Check the district counts
+  first and report uncertainty for any district comparison.
+
+## Suggested presentation takeaway
+
+Use the three estimates from the results table to state how the estimated gap
+changes from the pooled model to the district-adjusted model and then to the
+model that also adjusts for floor area. Insert the values generated by this
+report after the team reproduces and checks them in R.
